@@ -6,6 +6,17 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 
 
+def cosine_similarity(vec1, vec2):
+    dot_product = np.dot(vec1, vec2)
+    norm1 = np.linalg.norm(vec1)
+    norm2 = np.linalg.norm(vec2)
+
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+
+    return dot_product / (norm1 * norm2)
+
+
 class SemanticSearch:
     def __init__(self):
         self.model = SentenceTransformer('all-MiniLM-L6-v2')
@@ -60,6 +71,31 @@ class SemanticSearch:
         # If cache invalid or non-existent, rebuild
         return self.build_embeddings(documents)
 
+    def search(self, query, limit=5):
+        if self.embeddings is None:
+            raise ValueError("No embeddings loaded. Call `load_or_create_embeddings` first.")
+            
+        query_embedding = self.generate_embedding(query)
+        
+        results = []
+        for doc_index, doc in enumerate(self.documents):
+            doc_embedding = self.embeddings[doc_index]
+            score = cosine_similarity(query_embedding, doc_embedding)
+            results.append((score, doc))
+            
+        # Sort by similarity score in descending order
+        results.sort(key=lambda x: x[0], reverse=True)
+        
+        top_results = []
+        for score, doc in results[:limit]:
+            top_results.append({
+                "score": float(score),
+                "title": doc["title"],
+                "description": doc["description"]
+            })
+            
+        return top_results
+
 
 def verify_model():
     search = SemanticSearch()
@@ -93,6 +129,35 @@ def embed_text(text):
     print(f"Dimensions: {embedding.shape[0]}")
 
 
+def embed_query_text(query):
+    search = SemanticSearch()
+    embedding = search.generate_embedding(query)
+    
+    print(f"Query: {query}")
+    print(f"First 3 dimensions: {embedding[:3]}")
+    print(f"Shape: {embedding.shape}")
+
+
+def run_semantic_search(query, limit):
+    search = SemanticSearch()
+    try:
+        with open("data/movies.json", "r", encoding="utf-8") as f:
+            documents = json.load(f)["movies"]
+    except FileNotFoundError:
+        print("data/movies.json not found! Please check your file paths.")
+        return
+        
+    search.load_or_create_embeddings(documents)
+    results = search.search(query, limit)
+    
+    for i, res in enumerate(results, 1):
+        desc = res["description"]
+        if len(desc) > 85: 
+            desc = desc[:85] + "..."
+        print(f"{i}. {res['title']} (score: {res['score']:.4f})")
+        print(f"  {desc}\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Semantic Search CLI")
     subparsers = parser.add_subparsers(dest="command")
@@ -106,6 +171,14 @@ def main():
     # NEW: verify_embeddings command (NO arguments needed)
     subparsers.add_parser("verify_embeddings", help="Verify document embeddings over our dataset")
 
+    # NEW: embedquery command
+    embedquery_parser = subparsers.add_parser("embedquery", help="Embed a search query")
+    embedquery_parser.add_argument("query", type=str, help="The search query string")
+
+    # NEW: search command
+    search_parser = subparsers.add_parser("search", help="Search movies by meaning")
+    search_parser.add_argument("query", type=str, help="Search query")
+    search_parser.add_argument("--limit", type=int, default=5, help="Number of results to return")
 
     args = parser.parse_args()
 
@@ -118,6 +191,10 @@ def main():
         case "verify_embeddings":
             # NEW: Handle the verify_embeddings command
             verify_embeddings()
+        case "embedquery":
+            embed_query_text(args.query)
+        case "search":
+            run_semantic_search(args.query, args.limit)
         case _:
             parser.print_help()
 

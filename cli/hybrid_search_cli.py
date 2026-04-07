@@ -155,9 +155,10 @@ def run_weighted_search(query, alpha, limit):
         print(f"  BM25: {res['bm25_score']:.3f}, Semantic: {res['semantic_score']:.3f}")
         print(f"  {res['description']}")
 
-def run_rrf_search(query, k, limit, enhance=None):
-    if enhance in ("spell", "rewrite", "expand"):
+def run_rrf_search(query, k, limit, enhance=None, rerank_method=None, evaluate=False):
+    if enhance in ("spell", "rewrite", "expand") or rerank_method in ("individual", "batch"):
         import os
+        import time
         from dotenv import load_dotenv
         from google import genai
         
@@ -169,6 +170,7 @@ def run_rrf_search(query, k, limit, enhance=None):
             
         client = genai.Client(api_key=api_key)
         
+        prompt = None
         if enhance == "spell":
             prompt = f"""Fix any spelling errors in the user-provided movie search query below.
 Correct only clear, high-confidence typos. Do not rewrite, add, remove, or reorder words.
@@ -212,19 +214,20 @@ Examples:
 User query: "{query}"
 """
             
-        response = client.models.generate_content(
-            model="gemma-3-27b-it",
-            contents=prompt,
-        )
-        
-        if enhance == "expand":
-            expanded_terms = response.text.strip()
-            enhanced_query = f"{query} {expanded_terms}" if expanded_terms else query
-        else:
-            enhanced_query = response.text.strip()
+        if prompt:
+            response = client.models.generate_content(
+                model="gemma-3-27b-it",
+                contents=prompt,
+            )
             
-        print(f"Enhanced query ({enhance}): '{query}' -> '{enhanced_query}'\n")
-        query = enhanced_query
+            if enhance == "expand":
+                expanded_terms = response.text.strip()
+                enhanced_query = f"{query} {expanded_terms}" if expanded_terms else query
+            else:
+                enhanced_query = response.text.strip()
+                
+            print(f"Enhanced query ({enhance}): '{query}' -> '{enhanced_query}'\n")
+            query = enhanced_query
 
     import json
     try:
@@ -235,13 +238,180 @@ User query: "{query}"
         return
         
     search = HybridSearch(documents)
-    results = search.rrf_search(query, k, limit)
+    search_limit = limit * 5 if rerank_method in ("individual", "batch", "cross_encoder") else limit
+    results = search.rrf_search(query, k, search_limit)
+
+    if rerank_method == "individual":
+        print(f"Re-ranking top {len(results)} results using individual method...")
+        for res in results:
+            prompt = f"""Rate how well this movie matches the search query.
+
+Query: "{query}"
+Movie: {res.get("title", "")} - {res.get("description", "")}
+
+Consider:
+- Direct relevance to query
+- User intent (what they're looking for)
+- Content appropriateness
+
+Rate 0-10 (10 = perfect match).
+Output ONLY the number in your response, no other text or explanation.
+
+Score:"""
+            response = client.models.generate_content(
+                model="gemma-3-27b-it",
+                contents=prompt,
+            )
+            try:
+                res["rerank_score"] = float(response.text.strip())
+            except ValueError:
+                res["rerank_score"] = 0.0
+            time.sleep(3)
+            
+        results.sort(key=lambda x: x["rerank_score"], reverse=True)
+        results = results[:limit]
+        print(f"Reciprocal Rank Fusion Results for '{query}' (k={k}):\n")
+        
+    elif rerank_method == "batch":
+        print(f"Re-ranking top {len(results)} results using batch method...")
+        doc_list_strs = []
+        for res in results:
+            doc_list_strs.append(f"ID: {res['id']}\nTitle: {res.get('title', '')}\nDescription: {res.get('description', '')[:100]}...")
+        doc_list_str = "\n\n".join(doc_list_strs)
+        
+        prompt = f"""Rank the movies listed below by relevance to the following search query.
+
+Query: "{query}"
+
+Movies:
+{doc_list_str}
+
+Return ONLY the movie IDs in order of relevance (best match first). Return a valid JSON list, nothing else.
+
+For example:
+[75, 12, 34, 2, 1]
+
+Ranking:"""
+        response = client.models.generate_content(
+            model="gemma-3-27b-it",
+            contents=prompt,
+        )
+        try:
+            import json
+            clean_text = response.text.strip()
+            if clean_text.startswith("```json"):
+                clean_text = clean_text[7:]
+            elif clean_text.startswith("```"):
+                clean_text = clean_text[3:]
+            if clean_text.endswith("```"):
+                clean_text = clean_text[:-3]
+            ranked_ids = json.loads(clean_text.strip())
+        except Exception:
+            ranked_ids = []
+            
+        rank_map = {doc_id: rank for rank, doc_id in enumerate(ranked_ids, 1)}
+        for res in results:
+            res["rerank_rank"] = rank_map.get(res["id"], float("inf"))
+            
+        results.sort(key=lambda x: x["rerank_rank"])
+        results = results[:limit]
+        print(f"Reciprocal Rank Fusion Results for '{query}' (k={k}):\n")
+        
+    elif rerank_method == "cross_encoder":
+        print(f"Re-ranking top {len(results)} results using cross_encoder method...")
+        from sentence_transformers import CrossEncoder
+        cross_encoder = CrossEncoder("cross-encoder/ms-marco-TinyBERT-L2-v2")
+        pairs = []
+        for res in results:
+            pairs.append([query, f"{res.get('title', '')} - {res.get('description', '')}"])
+            
+        scores = cross_encoder.predict(pairs)
+        for idx, res in enumerate(results):
+            res["cross_encoder_score"] = float(scores[idx])
+            
+        results.sort(key=lambda x: x["cross_encoder_score"], reverse=True)
+        results = results[:limit]
+        print(f"Reciprocal Rank Fusion Results for '{query}' (k={k}):\n")
     
     for i, res in enumerate(results, 1):
         print(f"{i}. {res['title']}")
-        print(f"  RRF Score: {res['rrf_score']:.3f}")
-        print(f"  BM25 Rank: {res['bm25_rank']}, Semantic Rank: {res['semantic_rank']}")
-        print(f"  {res['description']}")
+        if rerank_method == "individual":
+            print(f"   Re-rank Score: {res['rerank_score']:.3f}/10")
+            print(f"   RRF Score: {res['rrf_score']:.3f}")
+            print(f"   BM25 Rank: {res['bm25_rank']}, Semantic Rank: {res['semantic_rank']}")
+            print(f"   {res['description']}\n")
+        elif rerank_method == "batch":
+            print(f"   Re-rank Rank: {res.get('rerank_rank', 'N/A')}")
+            print(f"   RRF Score: {res['rrf_score']:.3f}")
+            print(f"   BM25 Rank: {res['bm25_rank']}, Semantic Rank: {res['semantic_rank']}")
+            print(f"   {res['description']}\n")
+        elif rerank_method == "cross_encoder":
+            print(f"   Cross Encoder Score: {res['cross_encoder_score']:.3f}")
+            print(f"   RRF Score: {res['rrf_score']:.3f}")
+            print(f"   BM25 Rank: {res['bm25_rank']}, Semantic Rank: {res['semantic_rank']}")
+            print(f"   {res['description']}\n")
+        else:
+            print(f"  RRF Score: {res['rrf_score']:.3f}")
+            print(f"  {res['description']}")
+
+    if evaluate:
+        import os
+        from dotenv import load_dotenv
+        from google import genai
+        import json
+        
+        load_dotenv()
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            print("Error: GEMINI_API_KEY environment variable not set")
+            return
+            
+        client = genai.Client(api_key=api_key)
+        
+        formatted_results = []
+        for res in results:
+            formatted_results.append(f"{res.get('title', '')} - {res.get('description', '')}")
+            
+        prompt = f"""Rate how relevant each result is to this query on a 0-3 scale:
+
+Query: "{query}"
+
+Results:
+{chr(10).join(formatted_results)}
+
+Scale:
+- 3: Highly relevant
+- 2: Relevant
+- 1: Marginally relevant
+- 0: Not relevant
+
+Do NOT give any numbers other than 0, 1, 2, or 3.
+
+Return ONLY the scores in the same order you were given the documents. Return a valid JSON list, nothing else. For example:
+
+[2, 0, 3, 2, 0, 1]"""
+
+        response = client.models.generate_content(
+            model="gemma-3-27b-it",
+            contents=prompt,
+        )
+
+        try:
+            clean_text = response.text.strip()
+            if clean_text.startswith("```json"):
+                clean_text = clean_text[7:]
+            elif clean_text.startswith("```"):
+                clean_text = clean_text[3:]
+            if clean_text.endswith("```"):
+                clean_text = clean_text[:-3]
+            scores = json.loads(clean_text.strip())
+        except Exception:
+            scores = []
+            
+        print()
+        for i, res in enumerate(results, 1):
+            score = scores[i - 1] if i - 1 < len(scores) else 0
+            print(f"{i}. {res.get('title', '')}: {score}/3")
 
 
 def main() -> None:
@@ -266,6 +436,17 @@ def main() -> None:
         choices=["spell", "rewrite", "expand"],
         help="Query enhancement method",
     )
+    rrf_parser.add_argument(
+        "--rerank-method",
+        type=str,
+        choices=["individual", "batch", "cross_encoder"],
+        help="Re-ranking method to use on results",
+    )
+    rrf_parser.add_argument(
+        "--evaluate",
+        action="store_true",
+        help="Evaluate the results using an LLM",
+    )
     args = parser.parse_args()
 
     match args.command:
@@ -274,7 +455,7 @@ def main() -> None:
         case "weighted-search":
             run_weighted_search(args.query, args.alpha, args.limit)
         case "rrf-search":
-            run_rrf_search(args.query, args.k, args.limit, args.enhance)
+            run_rrf_search(args.query, args.k, args.limit, args.enhance, args.rerank_method, args.evaluate)
 
         case _:
             parser.print_help()

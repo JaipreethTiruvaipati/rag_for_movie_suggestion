@@ -13,3 +13,6 @@ cache/
 .hf-cache/
 .uv-cache/
 .uv_cache/
+
+# Environment variables
+.env
